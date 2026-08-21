@@ -1,0 +1,34 @@
+# ─── SMTP Server Dockerfile ──────────────────────────────────────────────
+FROM node:20-slim AS builder
+
+WORKDIR /app
+
+# Copy only package files first (layer caching)
+COPY smtp-server/server.js ./
+COPY package.json ./
+RUN npm install --omit=dev smtp-server mailparser better-sqlite3
+
+# Production stage
+FROM node:20-slim
+
+# Security: run as non-root
+RUN groupadd -r mailghost && useradd -r -g mailghost -m mailghost
+
+WORKDIR /app
+
+# Copy dependencies and server
+COPY --from=builder /app/node_modules ./node_modules
+COPY --from=builder /app/server.js ./
+COPY --from=builder /app/package.json ./
+
+# Create data directory with proper permissions
+RUN mkdir -p /app/data && chown -R mailghost:mailghost /app
+
+USER mailghost
+
+EXPOSE 25 587 3001
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+  CMD node -e "fetch('http://localhost:3001/health').then(r=>{process.exit(r.ok?0:1)}).catch(()=>process.exit(1))"
+
+CMD ["node", "server.js"]

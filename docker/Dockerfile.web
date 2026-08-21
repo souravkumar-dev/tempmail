@@ -1,0 +1,43 @@
+# ─── Next.js Web App Dockerfile ──────────────────────────────────────────
+FROM node:20-slim AS builder
+
+WORKDIR /app
+
+# Copy package files first (layer caching)
+COPY package.json package-lock.json* ./
+RUN npm ci
+
+# Copy source code
+COPY . .
+
+# Build Next.js
+ENV NEXT_TELEMETRY_DISABLED=1
+RUN npm run build
+
+# ─── Production Stage ───────────────────────────────────────────────────
+FROM node:20-slim AS runner
+
+# Security: run as non-root
+RUN groupadd -r webapp && useradd -r -g webapp -m webapp
+
+WORKDIR /app
+
+ENV NODE_ENV=production
+ENV NEXT_TELEMETRY_DISABLED=1
+
+# Copy standalone build
+COPY --from=builder /app/.next/standalone ./
+COPY --from=builder /app/.next/static ./.next/static
+COPY --from=builder /app/public ./public
+
+# Fix permissions
+RUN chown -R webapp:webapp /app
+
+USER webapp
+
+EXPOSE 3000
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
+  CMD curl -f http://localhost:3000/api/health || exit 1
+
+CMD ["node", "server.js"]
