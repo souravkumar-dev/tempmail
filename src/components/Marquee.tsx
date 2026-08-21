@@ -23,18 +23,21 @@ export default function Marquee({
     if (!inner) return;
 
     let animationId: number;
-    let position = reverse ? -inner.scrollWidth / 2 : 0;
+    const halfWidth = inner.scrollWidth / 2;
+    let position = reverse ? 0 : 0;
 
     const animate = () => {
       const speedPx = speed / 60;
       if (reverse) {
-        position -= speedPx;
-        if (position <= -inner.scrollWidth / 2) {
-          position = 0;
+        // Scroll left to right
+        position += speedPx;
+        if (position >= 0) {
+          position = -halfWidth;
         }
       } else {
+        // Scroll right to left (default)
         position -= speedPx;
-        if (position <= -inner.scrollWidth / 2) {
+        if (position <= -halfWidth) {
           position = 0;
         }
       }
