@@ -1,5 +1,6 @@
 # 📧 MailGhost — Real Temporary Email Service for OTP Verification
-Vercel Link: "tempmail-six-rho.vercel.app"
+Vercel Link: https://tempmail-six-rho.vercel.app/
+
 
 A production-ready, self-hosted temporary email service. Users get disposable email addresses on your custom domain to receive real OTP codes from any website — including Google, Groww, banking apps, and more.
 
