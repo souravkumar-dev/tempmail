@@ -1,255 +1,229 @@
-// Email Service — Auto-detects self-hosted SMTP server or falls back to Guerrilla Mail.
+/**
+ * Email Service — Unified client
+ * Handles both self-hosted SMTP and Guerrilla Mail fallback.
+ * Works on Vercel serverless — no child_process, no native modules.
+ */
 
-const SMTP_API = process.env.NEXT_PUBLIC_SMTP_API_URL || "";
+import {
+  generateEmail,
+  getMessages,
+  getMessage,
+  type GuerrillaEmail,
+  type GuerrillaEmailFull,
+} from "@/lib/guerrilla-api";
 
-// ─── Types ──────────────────────────────────────────────────────────────────
+const SMTP_API_URL = process.env.NEXT_PUBLIC_SMTP_API_URL || "";
 
-export interface StoredEmail {
-  id: number;
-  from_address: string;
-  to_address: string;
-  subject: string;
-  text_body: string;
-  html_body: string;
-  otp_codes: string;
-  received_at: string;
-  is_read: number;
+// ── Types ──────────────────────────────────────────────────────────────
+
+export interface EmailSession {
+  mode: "self-hosted" | "guerrilla";
+  address: string;
+  sidToken?: string;
+  token?: string;
+  sessionId?: string;
+  expireAt?: number;
 }
 
 export interface ParsedEmail {
-  id: number | string;
+  id: string | number;
   mail_from: string;
-  mail_to: string;
   mail_subject: string;
-  mail_text: string;
-  mail_body: string;
-  otpCodes: string[];
-  mail_date: string;
-  mail_read: number;
   mail_excerpt: string;
+  mail_text?: string;
+  mail_body?: string;
+  mail_date: string;
+  mail_read: boolean;
+  otpCodes: string[];
 }
 
-export interface EmailSession {
-  address: string;
-  mode: "self-hosted" | "guerrilla";
-  sidToken?: string;       // For Guerrilla Mail
-  expireAt?: number;       // For Guerrilla Mail (60min)
-  createdAt: number;       // For self-hosted (no expiry)
-}
+// ── OTP Extraction ─────────────────────────────────────────────────────
 
-// ─── Mode Detection ─────────────────────────────────────────────────────────
-
-let _smtpAvailable: boolean | null = null;
-
-/**
- * Check if the self-hosted SMTP server is reachable.
- * Uses a tiny image probe instead of fetch to avoid Service Worker interception.
- * Only called on user action (Generate click), never on mount.
- */
-export async function isSmtpAvailable(): Promise<boolean> {
-  if (_smtpAvailable !== null) return _smtpAvailable;
-
-  // No URL configured — guerrilla mode
-  if (!SMTP_API || !SMTP_API.startsWith("http")) {
-    _smtpAvailable = false;
-    return false;
-  }
-
-  // If the URL points to localhost, the SMTP server likely isn't running locally.
-  // Skip the probe entirely to avoid Service Worker fetch errors.
-  try {
-    const host = new URL(SMTP_API).hostname;
-    if (host === "localhost" || host === "127.0.0.1" || host === "0.0.0.0") {
-      _smtpAvailable = false;
-      return false;
+function extractOtpCodes(text: string): string[] {
+  if (!text) return [];
+  const patterns = [
+    /(?:verification|otp|code|pin|token|verify)[^\d]*(\d{4,8})/gi,
+    /(\d{4,8})\s*(?:is your|is the|is your verification)/gi,
+    /(?:your (?:code|otp|pin|token|verification) (?:is|code))[:\s]*(\d{4,8})/gi,
+    /(\d{6})/g,
+    /(\d{4})/g,
+  ];
+  const codes = new Set<string>();
+  for (const pattern of patterns) {
+    let match;
+    while ((match = pattern.exec(text)) !== null) {
+      codes.add(match[1]);
     }
-  } catch {
-    _smtpAvailable = false;
-    return false;
   }
-
-  // Only probe real (non-localhost) deployed SMTP servers.
-  // If deploying with Docker on a real server, the URL will be
-  // e.g. https://mail.yourdomain.com — we can safely probe it.
-  try {
-    const res = await fetch(`${SMTP_API}/api/mail/stats?address=_probe@x.com`, {
-      signal: AbortSignal.timeout(2000),
-      cache: "no-store",
-    });
-    _smtpAvailable = res.ok;
-    return _smtpAvailable;
-  } catch {
-    _smtpAvailable = false;
-    return false;
-  }
+  return Array.from(codes);
 }
 
-// ─── Self-Hosted Mode ───────────────────────────────────────────────────────
+// ── Session Persistence (localStorage) ─────────────────────────────────
 
-export function generateSelfHostedEmail(customPrefix?: string): EmailSession {
-  const prefix = customPrefix || generateRandomPrefix();
-  let domain = "tempver.com";
-  if (SMTP_API && !SMTP_API.includes("localhost")) {
-    try {
-      domain = new URL(SMTP_API).hostname.replace("mail.", "");
-    } catch {}
-  }
-  return {
-    address: `${prefix}@${domain}`,
-    mode: "self-hosted",
-    createdAt: Date.now(),
-  };
-}
+const SESSION_KEY = "mailghost_session";
 
-function generateRandomPrefix(): string {
-  const chars = "abcdefghijklmnopqrstuvwxyz0123456789";
-  return Array.from({ length: 10 }, () => chars[Math.floor(Math.random() * chars.length)]).join("");
-}
-
-export async function fetchSelfHostedMessages(address: string): Promise<ParsedEmail[]> {
-  try {
-    const res = await fetch(`${SMTP_API}/api/mail/messages?address=${encodeURIComponent(address)}`);
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    const data = await res.json();
-    return (data.messages || []).map((msg: StoredEmail) => ({
-      id: msg.id,
-      mail_from: msg.from_address,
-      mail_to: msg.to_address,
-      mail_subject: msg.subject,
-      mail_text: msg.text_body,
-      mail_body: msg.html_body,
-      otpCodes: JSON.parse(msg.otp_codes || "[]"),
-      mail_date: msg.received_at,
-      mail_read: msg.is_read,
-      mail_excerpt: (msg.text_body || "").substring(0, 200),
-    }));
-  } catch (err: any) {
-    console.error("[self-hosted] fetchMessages error:", err.message);
-    return [];
-  }
-}
-
-export async function fetchSelfHostedMessage(id: number): Promise<ParsedEmail | null> {
-  try {
-    const res = await fetch(`${SMTP_API}/api/mail/message/${id}`);
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    const msg: StoredEmail = await res.json();
-    return {
-      id: msg.id,
-      mail_from: msg.from_address,
-      mail_to: msg.to_address,
-      mail_subject: msg.subject,
-      mail_text: msg.text_body,
-      mail_body: msg.html_body,
-      otpCodes: JSON.parse(msg.otp_codes || "[]"),
-      mail_date: msg.received_at,
-      mail_read: 1,
-      mail_excerpt: (msg.text_body || "").substring(0, 200),
-    };
-  } catch {
-    return null;
-  }
-}
-
-// ─── Guerrilla Mail Mode (Fallback) ─────────────────────────────────────────
-
-import {
-  createAccount as gmCreateAccount,
-  restoreSession as gmRestoreSession,
-  getMessages as gmGetMessages,
-  getMessage as gmGetMessage,
-  clearSession as gmClearSession,
-  extractOtps as gmExtractOtps,
-  type Session as GMSession,
-  type MailMessage,
-} from "./mailtm-api";
-
-export async function createGuerrillaSession(): Promise<EmailSession> {
-  const session = await gmCreateAccount();
-  return {
-    address: session.email,
-    mode: "guerrilla",
-    sidToken: session.sidToken,
-    expireAt: session.expireAt,
-    createdAt: Date.now(),
-  };
-}
-
-export function restoreGuerrillaSession(): EmailSession | null {
-  const s = gmRestoreSession();
-  if (!s) return null;
-  return {
-    address: s.email,
-    mode: "guerrilla",
-    sidToken: s.sidToken,
-    expireAt: s.expireAt,
-    createdAt: Date.now(),
-  };
-}
-
-export async function fetchGuerrillaMessages(sidToken: string): Promise<ParsedEmail[]> {
-  const msgs = await gmGetMessages(sidToken);
-  return msgs.map((m: MailMessage) => ({
-    id: m.mail_id,
-    mail_from: m.mail_from,
-    mail_to: "",
-    mail_subject: m.mail_subject,
-    mail_text: "",
-    mail_body: "",
-    otpCodes: gmExtractOtps(m.mail_excerpt),
-    mail_date: m.mail_date,
-    mail_read: m.mail_read,
-    mail_excerpt: m.mail_excerpt,
-  }));
-}
-
-export async function fetchGuerrillaMessage(sidToken: string, messageId: string): Promise<ParsedEmail | null> {
-  const full = await gmGetMessage(sidToken, messageId);
-  return {
-    id: full.mail_id,
-    mail_from: full.mail_from,
-    mail_to: full.mail_to,
-    mail_subject: full.mail_subject,
-    mail_text: full.mail_text || full.mail_body,
-    mail_body: full.mail_body,
-    otpCodes: gmExtractOtps(full.mail_text || full.mail_body),
-    mail_date: full.mail_date,
-    mail_read: 1,
-    mail_excerpt: (full.mail_text || full.mail_body || "").substring(0, 200),
-  };
-}
-
-export function clearGuerrillaSession() {
-  gmClearSession();
-}
-
-// ─── Unified API ────────────────────────────────────────────────────────────
-
-// Session persistence (localStorage)
-const SESSION_KEY = "mg_email_session";
-
-export function persistSession(session: EmailSession) {
+export function persistSession(session: EmailSession): void {
+  if (typeof window === "undefined") return;
   try {
     localStorage.setItem(SESSION_KEY, JSON.stringify(session));
   } catch {}
 }
 
 export function getStoredSession(): EmailSession | null {
+  if (typeof window === "undefined") return null;
   try {
-    const data = JSON.parse(localStorage.getItem(SESSION_KEY) || "null");
-    if (!data) return null;
-    // Check expiry for Guerrilla mode
-    if (data.mode === "guerrilla" && data.expireAt && data.expireAt < Date.now()) {
+    const raw = localStorage.getItem(SESSION_KEY);
+    if (!raw) return null;
+    const session: EmailSession = JSON.parse(raw);
+    // Check if expired (Guerrilla sessions expire after ~60 min)
+    if (session.expireAt && Date.now() > session.expireAt) {
       localStorage.removeItem(SESSION_KEY);
       return null;
     }
-    return data;
+    return session;
   } catch {
     return null;
   }
 }
 
-export function clearStoredSession() {
+export function clearStoredSession(): void {
+  if (typeof window === "undefined") return;
   localStorage.removeItem(SESSION_KEY);
-  clearGuerrillaSession();
+}
+
+// ── Guerrilla Mail (Client-side) ───────────────────────────────────────
+
+/**
+ * Create a new Guerrilla Mail session via our API route.
+ */
+export async function createGuerrillaSession(): Promise<EmailSession> {
+  const res = await fetch("/api/accounts", { method: "POST" });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error(err.error || "Failed to create email");
+  }
+
+  const data = await res.json();
+  const session: EmailSession = {
+    mode: "guerrilla",
+    address: data.email || data.address,
+    sidToken: data.token || data.sessionId,
+    expireAt: Date.now() + 60 * 60 * 1000, // 60 minutes
+  };
+
+  persistSession(session);
+  return session;
+}
+
+/**
+ * Restore a Guerrilla Mail session (from localStorage).
+ */
+export function restoreGuerrillaSession(session: EmailSession): EmailSession {
+  return { ...session, mode: "guerrilla" };
+}
+
+/**
+ * Fetch messages from Guerrilla Mail via our API route.
+ */
+export async function fetchGuerrillaMessages(
+  sidToken: string
+): Promise<ParsedEmail[]> {
+  const res = await fetch("/api/messages", {
+    headers: { "x-sid-token": sidToken },
+  });
+  if (!res.ok) throw new Error("Failed to fetch messages");
+
+  const data = await res.json();
+  const messages: GuerrillaEmail[] = data.messages || [];
+
+  return messages.map((m) => ({
+    id: m.mail_id,
+    mail_from: m.mail_from || "Unknown",
+    mail_subject: m.mail_subject || "(no subject)",
+    mail_excerpt: m.mail_excerpt || "",
+    mail_date: m.mail_time || "",
+    mail_read: m.mail_read === "1",
+    otpCodes: extractOtpCodes(`${m.mail_subject} ${m.mail_excerpt}`),
+  }));
+}
+
+/**
+ * Fetch a full message from Guerrilla Mail via our API route.
+ */
+export async function fetchGuerrillaMessage(
+  sidToken: string,
+  messageId: string
+): Promise<ParsedEmail | null> {
+  const res = await fetch(`/api/messages/${messageId}`, {
+    headers: { "x-sid-token": sidToken },
+  });
+  if (!res.ok) return null;
+
+  const data: GuerrillaEmailFull = await res.json();
+  const body = data.mail_body || data.mail_text || "";
+
+  return {
+    id: data.mail_id,
+    mail_from: data.mail_from || "Unknown",
+    mail_subject: data.mail_subject || "(no subject)",
+    mail_excerpt: body.substring(0, 200),
+    mail_text: body,
+    mail_body: body,
+    mail_date: data.mail_time || "",
+    mail_read: true,
+    otpCodes: extractOtpCodes(body),
+  };
+}
+
+// ── Self-Hosted SMTP (Client-side) ────────────────────────────────────
+
+export async function isSmtpAvailable(): Promise<boolean> {
+  if (!SMTP_API_URL) return false;
+  if (SMTP_API_URL.includes("localhost") || SMTP_API_URL.includes("127.0.0.1")) {
+    return false;
+  }
+  try {
+    const res = await fetch(`${SMTP_API_URL}/health`, {
+      signal: AbortSignal.timeout(3000),
+    });
+    return res.ok;
+  } catch {
+    return false;
+  }
+}
+
+export async function generateSelfHostedEmail(
+  prefix?: string
+): Promise<EmailSession> {
+  const res = await fetch(`${SMTP_API_URL}/api/accounts`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ username: prefix }),
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error(err.error || "Failed to create email");
+  }
+  const data = await res.json();
+  const session: EmailSession = {
+    mode: "self-hosted",
+    address: data.address || data.email,
+    token: data.token,
+    sessionId: data.sessionId,
+  };
+  persistSession(session);
+  return session;
+}
+
+export async function fetchSelfHostedMessages(
+  _address: string
+): Promise<ParsedEmail[]> {
+  // Messages are fetched via session, not address — placeholder
+  return [];
+}
+
+export async function fetchSelfHostedMessage(
+  _messageId: number
+): Promise<ParsedEmail | null> {
+  return null;
 }

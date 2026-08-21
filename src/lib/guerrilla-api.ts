@@ -1,30 +1,14 @@
-// Guerrilla Mail API client — uses curl via child_process for outbound HTTPS.
-// Guarilla Mail is free, reliable, and has CORS support.
+/**
+ * Guerrilla Mail API Client
+ * Works on Vercel serverless — uses native fetch, no child_process
+ */
 
-import { exec } from "child_process";
+const GUERRILLA_API = "https://api.guerrillamail.com/ajax.php";
 
-const API = "https://api.guerrillamail.com/ajax.php";
-
-function curlGet(url: string): Promise<any> {
-  return new Promise((resolve, reject) => {
-    const cmd = `curl -s --max-time 15 "${url}"`;
-    exec(cmd, { timeout: 20000, windowsHide: true }, (err, stdout) => {
-      if (err) return reject(new Error("curl failed: " + err.message?.substring(0, 100)));
-      try {
-        resolve(JSON.parse(stdout.trim()));
-      } catch {
-        reject(new Error("Invalid response from Guerrilla Mail"));
-      }
-    });
-  });
-}
-
-// ─── Types ──────────────────────────────────────────────────────────────────
-
+// ── Types ──────────────────────────────────────────────────────────────
 export interface GuerrillaSession {
-  email: string;
-  sidToken: string;
-  expireAt: number; // 60 minutes from creation
+  sid_token: string;
+  email_addr: string;
 }
 
 export interface GuerrillaEmail {
@@ -32,124 +16,124 @@ export interface GuerrillaEmail {
   mail_from: string;
   mail_subject: string;
   mail_excerpt: string;
-  mail_date: string;
-  mail_read: number;
-  mail_size: number;
+  mail_time: string;
+  mail_read: string;
+  mail_size: string;
 }
 
 export interface GuerrillaEmailFull {
   mail_id: string;
   mail_from: string;
-  mail_to: string;
   mail_subject: string;
   mail_body: string;
-  mail_text: string;
-  mail_date: string;
-  mail_headers: string;
+  mail_text?: string;
+  mail_time: string;
 }
 
-// ─── API Functions ──────────────────────────────────────────────────────────
+// ── Helpers ────────────────────────────────────────────────────────────
+async function apiGet(action: string, params: Record<string, string> = {}) {
+  const url = new URL(GUERRILLA_API);
+  url.searchParams.set("f", action);
+  for (const [k, v] of Object.entries(params)) {
+    url.searchParams.set(k, v);
+  }
+
+  const res = await fetch(url.toString(), {
+    headers: {
+      Accept: "application/json",
+      "User-Agent": "MailGhost/1.0",
+    },
+  });
+
+  if (!res.ok) {
+    throw new Error(`Guerrilla API error: ${res.status} ${res.statusText}`);
+  }
+
+  return res.json();
+}
+
+// ── Public API ─────────────────────────────────────────────────────────
 
 /**
- * Get a new random email address.
+ * Create a new Guerrilla Mail session and return a disposable email.
+ * This is the function called by POST /api/accounts
  */
-export async function generateEmail(): Promise<GuerrillaSession> {
-  const data = await curlGet(`${API}?f=get_email_address`);
-  if (!data.email_addr) {
-    throw new Error("Failed to generate email address");
-  }
+export async function generateEmail(): Promise<{
+  email: string;
+  sessionId: string;
+  token: string;
+  address: string;
+}> {
+  const data = await apiGet("get_email_address");
+  const email = data.email_addr as string;
   return {
-    email: data.email_addr,
-    sidToken: data.sid_token,
-    expireAt: Date.now() + 60 * 60 * 1000, // 60 min
+    email,
+    sessionId: data.sid_token,
+    token: data.sid_token,
+    address: email,
   };
 }
 
 /**
- * Get available domains.
+ * Fetch inbox messages for a session.
+ * This is the function called by GET /api/messages
  */
-export async function getDomains(): Promise<string[]> {
-  return ["guerrillamail.com", "guerrillamailblock.com", "grr.la", "guerrillamail.info", "guerrillamail.de"];
+export async function getMessages(
+  sidToken: string
+): Promise<GuerrillaEmail[]> {
+  const data = await apiGet("check_email", {
+    seq: "0",
+    sid_token: sidToken,
+  });
+  return (data.list || []) as GuerrillaEmail[];
 }
 
 /**
- * Check inbox for new emails.
+ * Fetch a single message by ID.
+ * This is the function called by GET /api/messages/[id]
  */
-export async function getMessages(sidToken: string): Promise<GuerrillaEmail[]> {
-  const data = await curlGet(`${API}?f=get_email_list&offset=0&sid_token=${sidToken}`);
-  if (!data.list) return [];
-  return data.list.filter((e: any) => e.mail_timestamp > 0); // Filter out system emails
-}
-
-/**
- * Fetch full email content by ID.
- */
-export async function getMessage(sidToken: string, mailId: string): Promise<GuerrillaEmailFull> {
-  const data = await curlGet(`${API}?f=fetch_email&email_id=${mailId}&sid_token=${sidToken}`);
-  if (!data.mail_body && !data.mail_text) {
-    throw new Error("Failed to fetch email");
-  }
+export async function getMessage(
+  sidToken: string,
+  emailId: string
+): Promise<GuerrillaEmailFull> {
+  const data = await apiGet("fetch_email", {
+    email_id: emailId,
+    sid_token: sidToken,
+  });
   return {
-    mail_id: data.mail_id || mailId,
+    mail_id: emailId,
     mail_from: data.mail_from || "",
-    mail_to: data.mail_to || "",
     mail_subject: data.mail_subject || "",
     mail_body: data.mail_body || "",
-    mail_text: data.mail_text || "",
-    mail_date: data.mail_date || "",
-    mail_headers: data.mail_headers || "",
+    mail_text: data.mail_text || data.mail_body || "",
+    mail_time: data.mail_time || "",
   };
 }
 
-// ─── OTP Extraction ─────────────────────────────────────────────────────────
+/**
+ * Get available Guerrilla Mail domains.
+ * This is the function called by GET /api/domains
+ */
+export async function getDomains(): Promise<string[]> {
+  return [
+    "guerrillamail.com",
+    "guerrillamailblock.com",
+    "grr.la",
+    "guerrillamail.info",
+    "guerrillamail.de",
+  ];
+}
 
 /**
- * Extract potential OTP codes from email text content.
+ * Set a custom username on an existing session.
  */
-export function extractOtps(text: string): string[] {
-  const patterns = [
-    /\b(\d{6})\b/g,
-    /\b(\d{4})\b/g,
-    /\b(\d{5})\b/g,
-    /\b(\d{8})\b/g,
-    /code[:\s]*(\d{4,8})/gi,
-    /code[:\s]*([A-Z0-9]{4,8})/gi,
-  ];
-
-  const codes = new Set<string>();
-  for (const pattern of patterns) {
-    let match;
-    while ((match = pattern.exec(text)) !== null) {
-      codes.add(match[1]);
-    }
-  }
-  return Array.from(codes);
-}
-
-// ─── Session Persistence (localStorage) ─────────────────────────────────────
-
-const STORAGE_KEY = "mg_guerrilla_session";
-
-export function persistSession(session: GuerrillaSession) {
-  if (typeof window === "undefined") return;
-  try {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(session));
-  } catch {}
-}
-
-export function getStoredSession(): GuerrillaSession | null {
-  if (typeof window === "undefined") return null;
-  try {
-    const data = JSON.parse(localStorage.getItem(STORAGE_KEY) || "null");
-    if (data && data.expireAt > Date.now()) return data;
-    localStorage.removeItem(STORAGE_KEY);
-    return null;
-  } catch {
-    return null;
-  }
-}
-
-export function clearSession() {
-  if (typeof window === "undefined") return;
-  localStorage.removeItem(STORAGE_KEY);
+export async function setEmail(
+  sidToken: string,
+  emailUser: string
+): Promise<string> {
+  const data = await apiGet("set_email_user", {
+    email_user: emailUser,
+    sid_token: sidToken,
+  });
+  return data.email_addr || "";
 }

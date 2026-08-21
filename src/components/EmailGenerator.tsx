@@ -134,7 +134,7 @@ export default function EmailGenerator() {
 
       if (mode === "self-hosted") {
         const prefix = customPrefixRef.current?.value?.trim() || undefined;
-        newSession = generateSelfHostedEmail(prefix);
+        newSession = await generateSelfHostedEmail(prefix);
       } else {
         newSession = await createGuerrillaSession();
       }
